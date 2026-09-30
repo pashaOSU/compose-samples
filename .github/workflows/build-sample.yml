@@ -1,5 +1,7 @@
 name: Build and Test Sample
 
+workflow_dispatch:
+
 on:
   workflow_call:
     inputs:
