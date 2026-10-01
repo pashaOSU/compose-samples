@@ -17,10 +17,185 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Hijack Jetchat and Inject Flashlight Code
+        run: |
+          # 1. Find the main app directory
+          MAIN_DIR=$(find . -path "*/src/main" -type d | head -n 1)
+          
+          # 2. Delete ALL of Google's Jetchat Kotlin code so it cannot possibly load
+          find "$MAIN_DIR/java" -name "*.kt" -type f -delete
+          
+          # 3. Overwrite the Manifest completely
+          cat << EOF > "$MAIN_DIR/AndroidManifest.xml"
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-feature android:name="android.hardware.camera.flash" />
+              <application android:allowBackup="true" android:label="Sound Flashlight" android:theme="@android:style/Theme.DeviceDefault.DayNight">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+          
+          # 4. Create the directory for the new code, disguised as Jetchat to keep Gradle happy
+          mkdir -p "$MAIN_DIR/java/com/example/compose/jetchat"
+          
+          # 5. Inject our complete Flashlight app code
+          cat << 'EOF' > "$MAIN_DIR/java/com/example/compose/jetchat/MainActivity.kt"
+          package com.example.compose.jetchat
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.hardware.camera2.CameraManager
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.MediaRecorder
+          import android.os.Bundle
+          import androidx.activity.ComponentActivity
+          import androidx.activity.compose.setContent
+          import androidx.activity.result.contract.ActivityResultContracts
+          import androidx.compose.foundation.layout.*
+          import androidx.compose.material3.*
+          import androidx.compose.runtime.*
+          import androidx.compose.ui.Alignment
+          import androidx.compose.ui.Modifier
+          import androidx.compose.ui.unit.dp
+          import androidx.core.content.ContextCompat
+          import kotlinx.coroutines.*
+          import kotlin.math.abs
+
+          class MainActivity : ComponentActivity() {
+              private lateinit var cameraManager: CameraManager
+              private var cameraId: String? = null
+              
+              private val requestPermissionLauncher = registerForActivityResult(
+                  ActivityResultContracts.RequestMultiplePermissions()
+              ) { }
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  
+                  cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                  cameraId = cameraManager.cameraIdList.firstOrNull { 
+                      cameraManager.getCameraCharacteristics(it)
+                          .get(android.hardware.camera2.CameraCharacteristics.FLASH_INFO_AVAILABLE) == true 
+                  }
+
+                  if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissionLauncher.launch(arrayOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA))
+                  }
+
+                  setContent {
+                      MaterialTheme {
+                          Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                              SoundFlashlightScreen(
+                                  onTriggerFlashlight = { duration -> triggerFlashlight(duration) },
+                                  checkPermission = { 
+                                      ContextCompat.checkSelfPermission(this@MainActivity, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED 
+                                  }
+                              )
+                          }
+                      }
+                  }
+              }
+
+              private fun triggerFlashlight(durationMs: Long) {
+                  if (cameraId == null) return
+                  CoroutineScope(Dispatchers.Main).launch {
+                      try {
+                          cameraManager.setTorchMode(cameraId!!, true)
+                          delay(durationMs)
+                          cameraManager.setTorchMode(cameraId!!, false)
+                      } catch (e: Exception) {
+                          e.printStackTrace()
+                      }
+                  }
+              }
+          }
+
+          @Composable
+          fun SoundFlashlightScreen(
+              onTriggerFlashlight: (Long) -> Unit,
+              checkPermission: () -> Boolean
+          ) {
+              var isListening by remember { mutableStateOf(false) }
+              var threshold by remember { mutableFloatStateOf(15000f) }
+              var duration by remember { mutableFloatStateOf(1000f) }
+              var currentAmplitude by remember { mutableIntStateOf(0) }
+
+              LaunchedEffect(isListening) {
+                  if (isListening && checkPermission()) {
+                      withContext(Dispatchers.IO) {
+                          val sampleRate = 44100
+                          val channelConfig = AudioFormat.CHANNEL_IN_MONO
+                          val audioFormat = AudioFormat.ENCODING_PCM_16BIT
+                          val bufferSize = AudioRecord.getMinBufferSize(sampleRate, channelConfig, audioFormat)
+
+                          val audioRecord = AudioRecord(
+                              MediaRecorder.AudioSource.MIC,
+                              sampleRate, channelConfig, audioFormat, bufferSize
+                          )
+                          val buffer = ShortArray(bufferSize)
+                          audioRecord.startRecording()
+
+                          try {
+                              while (isActive && isListening) {
+                                  val readSize = audioRecord.read(buffer, 0, bufferSize)
+                                  if (readSize > 0) {
+                                      val maxAmplitude = buffer.maxOfOrNull { abs(it.toInt()) } ?: 0
+                                      currentAmplitude = maxAmplitude
+                                      if (maxAmplitude > threshold) {
+                                          onTriggerFlashlight(duration.toLong())
+                                          delay(duration.toLong() + 500L) 
+                                      }
+                                  }
+                                  delay(50)
+                              }
+                          } finally {
+                              audioRecord.stop()
+                              audioRecord.release()
+                              currentAmplitude = 0
+                          }
+                      }
+                  }
+              }
+
+              Column(
+                  modifier = Modifier.padding(24.dp).fillMaxSize(),
+                  horizontalAlignment = Alignment.CenterHorizontally,
+                  verticalArrangement = Arrangement.Center
+              ) {
+                  Text("Sound Flashlight", style = MaterialTheme.typography.headlineMedium)
+                  Spacer(modifier = Modifier.height(32.dp))
+                  Text("Current Sound Level: $currentAmplitude")
+                  LinearProgressIndicator(
+                      progress = { (currentAmplitude / 32767f).coerceIn(0f, 1f) },
+                      modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)
+                  )
+                  Spacer(modifier = Modifier.height(24.dp))
+                  Text("Activation Threshold: ${threshold.toInt()}")
+                  Slider(value = threshold, onValueChange = { threshold = it }, valueRange = 1000f..32000f)
+                  Spacer(modifier = Modifier.height(16.dp))
+                  Text("Flashlight Duration: ${duration.toInt()} ms")
+                  Slider(value = duration, onValueChange = { duration = it }, valueRange = 100f..5000f)
+                  Spacer(modifier = Modifier.height(32.dp))
+                  Button(onClick = { isListening = !isListening }, modifier = Modifier.fillMaxWidth().height(56.dp)) {
+                      Text(if (isListening) "Stop Listening" else "Start Listening")
+                  }
+              }
+          }
+          EOF
+
       - name: Find and Build Debug APK
         run: |
           PROJECT_DIR=$(dirname $(find . -name "settings.gradle" -o -name "settings.gradle.kts" | head -n 1))
-          echo "Found Android project in: $PROJECT_DIR"
           cd "$PROJECT_DIR"
           gradle assembleDebug
 
